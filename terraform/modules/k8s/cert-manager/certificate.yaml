@@ -1,0 +1,19 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tls-secret
+  namespace: applications
+spec:
+  secretName: tls-secret
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: DNS_NAME
+  dnsNames:
+  - DNS_NAME
+  acme:
+    config:
+    - http01:
+        ingressClass: nginx
+      domains:
+      - DNS_NAME

@@ -1,0 +1,90 @@
+name: Deploy infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment for this deployment (e.g. DEV, TEST, PROD)'
+        required: true
+      customer_name: 
+        description: 'The name of the client.'
+        required: true
+      dns_name:
+        description: 'The name of the DNS record created for the environment, e.g. client-dev.makailabs.dev'
+
+env: 
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  TF_VAR_location: "southcentralus"
+  TF_VAR_resource_group_name: "${{ github.event.inputs.customer_name }}-${{ github.event.inputs.environment }}"
+  TF_VAR_environment: "${{ github.event.inputs.environment }}" 
+  BACKEND_RESOURCE_GROUP_NAME: "${{ github.event.inputs.customer_name }}-${{ github.event.inputs.environment }}-terraform"
+    
+jobs:
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: set up dns name for k8s tls certificate
+        working-directory: terraform/modules/k8s/cert-manager
+        run: sed -i 's/DNS_NAME/${{ github.event.inputs.dns_name }}/g' certificate.yaml
+
+      - name: set up dns name for ingress rules
+        working-directory: terraform/modules/k8s/nginx-ingress
+        run: sed -i 's/DNS_NAME/${{ github.event.inputs.dns_name }}/g' ingress.yaml
+
+      - name: login to azure
+        uses: azure/cli@v1
+        with:
+          inlineScript: |
+            az login --service-principal \
+            -u $ARM_CLIENT_ID -p $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID
+            
+            az account set -s $ARM_SUBSCRIPTION_ID
+      
+      - name: create backend resource group
+        id: rg
+        uses: azure/cli@v1
+        with:
+          inlineScript: |
+            resource_group_name="$(echo "$BACKEND_RESOURCE_GROUP_NAME" | tr "[:upper:]" "[:lower:]")"
+            az group create -l $TF_VAR_location -n $resource_group_name
+
+             echo "BACKEND_RESOURCE_GROUP_NAME=$resource_group_name" >> $GITHUB_OUTPUT
+
+      - name: create backend storage
+        uses: azure/cli@v1
+        id: create-backend-storage
+        with:
+          inlineScript: |
+            storage_account_name="$(echo "${TF_VAR_resource_group_name}tfstates" | tr "[:upper:]" "[:lower:]" | sed 's/-//g')"
+
+            if [az storage account list -g ${{ steps.rg.outputs.BACKEND_RESOURCE_GROUP_NAME }} --query "[].name" --output tsv]
+            then
+              echo "storage account $storage_account_name already exists, skipping..."
+            else
+              az storage account create -n $storage_account_name -g ${{ steps.rg.outputs.BACKEND_RESOURCE_GROUP_NAME }} \
+              -l $TF_VAR_location --sku Standard_LRS --access-tier Cool --kind StorageV2
+              az storage container create -n tfstates --account-name $storage_account_name
+            fi
+
+            echo "BACKEND_STORAGE_ACCOUNT_NAME=$storage_account_name" >> $GITHUB_OUTPUT
+
+      - name: terraform init
+        id: init
+        working-directory: terraform
+        run: terraform init -backend-config="resource_group_name=${{ steps.rg.outputs.BACKEND_RESOURCE_GROUP_NAME }}" -backend-config="storage_account_name=${{ steps.create-backend-storage.outputs.BACKEND_STORAGE_ACCOUNT_NAME }}" -backend-config="container_name=tfstates" -backend-config="key=$TF_VAR_environment.terraform.tfstate"
+      
+      - name: terraform plan
+        id: plan
+        working-directory: terraform
+        run: terraform plan -out tfplan
+
+      - name: terraform apply
+        id: apply
+        working-directory: terraform
+        run: terraform apply tfplan
